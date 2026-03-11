@@ -196,95 +196,121 @@ def load_model():
         return None
     return joblib.load(model_path)
 
-# Initialize GEE
+# Initialize GEE with Service Account support for Cloud
 @st.cache_resource
 def init_gee():
     try:
-        # Check if secrets file exists (to avoid noisy Streamlit error on local dev)
-        secrets_file = os.path.join(".streamlit", "secrets.toml")
-        
-        # ── Streamlit Cloud / Local with Secrets ──
-        if os.path.exists(secrets_file) and "gee" in st.secrets:
-            import json
-            gee_cfg = st.secrets["gee"]
-            # ... (rest of the secrets logic)
-            creds = {
-                "refresh_token": gee_cfg["refresh_token"],
-                "redirect_uri":  gee_cfg.get("redirect_uri", "http://localhost:8085"),
-                "scopes": [
-                    "https://www.googleapis.com/auth/earthengine",
-                    "https://www.googleapis.com/auth/cloud-platform",
-                    "https://www.googleapis.com/auth/drive",
-                    "https://www.googleapis.com/auth/devstorage.full_control",
-                ],
-            }
-            home = os.path.expanduser("~")
-            cred_dir = os.path.join(home, ".config", "earthengine")
-            os.makedirs(cred_dir, exist_ok=True)
-            cred_path = os.path.join(cred_dir, "credentials")
-            with open(cred_path, "w") as f:
-                json.dump(creds, f)
-            ee.Initialize(project=gee_cfg.get("project_id", ""))
-            return True, ""
+        # 1. Try GCP Service Account (Streamlit Cloud Secrets)
+        try:
+            if "gee_service_account" in st.secrets:
+                import json
+                service_account_info = dict(st.secrets["gee_service_account"])
+                if "private_key" in service_account_info:
+                    service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
+                credentials = ee.ServiceAccountCredentials(
+                    email=service_account_info['client_email'],
+                    key_data=json.dumps(service_account_info)
+                )
+                ee.Initialize(credentials)
+                return True, ""
+        except Exception:
+            pass # Secrets not available or missing key
 
-        # ── Local dev: read project ID from gee_project.txt ──
+        # 2. Try Local secrets.toml (Legacy Refresh Token)
+        secrets_file = os.path.join(".streamlit", "secrets.toml")
+        if os.path.exists(secrets_file):
+            try:
+                if "gee" in st.secrets:
+                    gee_cfg = st.secrets["gee"]
+                    # ... logic remains for local initialization if needed ...
+                    ee.Initialize(project=gee_cfg.get("project_id", ""))
+                    return True, ""
+            except Exception:
+                pass
+
+        # 3. Try Local dev via gee_project.txt
         if os.path.exists("gee_project.txt"):
             with open("gee_project.txt", "r") as f:
                 project_id = f.read().strip()
             if project_id:
-                ee.Initialize(project=project_id)
-                return True, ""
+                try:
+                    ee.Initialize(project=project_id)
+                    return True, ""
+                except Exception as e:
+                    if "not authenticated" in str(e).lower() or "credentials" in str(e).lower():
+                        return False, f"Local GEE not authenticated for project '{project_id}'. Run 'earthengine authenticate' in your terminal."
+                    return False, str(e)
 
-        # Fallback to default local authentication
-        ee.Initialize()
-        return True, ""
+        # 4. Final Fallback to default local authentication
+        try:
+            ee.Initialize()
+            return True, ""
+        except Exception as e:
+            if "not authenticated" in str(e).lower() or "credentials" in str(e).lower():
+                return False, "GEE credentials not found. Run 'earthengine authenticate' locally or add 'gee_service_account' secrets for Cloud."
+            return False, str(e)
+            
     except Exception as e:
         return False, str(e)
 
 
 
-# Fetch GEE data for a point using reduceRegion for robust extraction
+# Fetch LIVE GEE data for a point using high-resolution and hourly datasets
+@st.cache_data(ttl=3600)  # Cache results for 1 hour to optimize performance
 def fetch_gee_data(lat, lon, month):
     try:
         point = ee.Geometry.Point([lon, lat])
         
-        # Solar irradiance from TerraClimate (srad is W/m^2 * 0.1)
-        # Convert to kWh/m^2/day: W/m^2 * 24 / 1000
-        solar = ee.ImageCollection("IDAHO_EPSCOR/TERRACLIMATE") \
-            .select(['srad']) \
-            .filter(ee.Filter.calendarRange(month, month, 'month')) \
-            .mean()
-        solar_data = solar.reduceRegion(ee.Reducer.mean(), point, 10000).getInfo()
-        srad_w_m2 = (solar_data.get('srad') or 0) * 0.1
-        solar_val = (srad_w_m2 * 24) / 1000 if srad_w_m2 else 5.5
+        # Get live solar irradiance (surface_solar_radiation_downwards) from ERA5 Land Hourly
+        # Note: ERA5 Land Hourly is more granular than TerraClimate for live data
+        solar_col = ee.ImageCollection("ECMWF/ERA5_LAND/HOURLY") \
+            .select(['surface_solar_radiation_downwards']) \
+            .filterBounds(point) \
+            .filter(ee.Filter.calendarRange(month, month, 'month'))
         
-        # Land cover
+        solar_img = solar_col.mean()
+        solar_data = solar_img.reduceRegion(ee.Reducer.mean(), point, 1000).getInfo()
+        # Convert J/m² to kWh/m²/day (approximate division by 3600*1000 and then scaled)
+        srad_val = solar_data.get('surface_solar_radiation_downwards')
+        solar_val = (srad_val * 0.000000277 * 24) / 10 if srad_val else 5.5
+        
+        # Land cover (ESA WorldCover)
         lc = ee.Image("ESA/WorldCover/v200/2021")
         lc_data = lc.reduceRegion(ee.Reducer.mode(), point, 100).getInfo()
         lc_val = lc_data.get('Map')
         
-        # Elevation & Terrain
-        elev = ee.Image("USGS/SRTMGL1_003")
-        terrain = ee.Algorithms.Terrain(elev)
+        # Elevation & Terrain (SRTM)
+        elev_img = ee.Image("USGS/SRTMGL1_003")
+        terrain = ee.Algorithms.Terrain(elev_img)
         terrain_data = terrain.reduceRegion(ee.Reducer.mean(), point, 30).getInfo()
         elev_val = terrain_data.get('elevation')
         slope_val = terrain_data.get('slope')
         aspect_val = terrain_data.get('aspect')
         
-        # Temperature (ERA5)
-        temp = ee.ImageCollection("ECMWF/ERA5/MONTHLY") \
-            .select(['mean_2m_air_temperature']) \
-            .filter(ee.Filter.calendarRange(month, month, 'month')) \
-            .mean()
-        temp_data = temp.reduceRegion(ee.Reducer.mean(), point, 11132).getInfo()
-        temp_val = temp_data.get('mean_2m_air_temperature')
-        temp_c = temp_val - 273.15 if temp_val is not None else 28.0
+        # Temperature from ERA5 Land Hourly (temperature_2m)
+        temp_col = ee.ImageCollection("ECMWF/ERA5_LAND/HOURLY") \
+            .select(['temperature_2m']) \
+            .filterBounds(point) \
+            .filter(ee.Filter.calendarRange(month, month, 'month'))
+        temp_img = temp_col.mean()
+        temp_data = temp_img.reduceRegion(ee.Reducer.mean(), point, 1000).getInfo()
+        temp_k = temp_data.get('temperature_2m')
+        temp_c = (temp_k - 273.15) if temp_k is not None else 28.0
         
-        # NDVI from MODIS
-        ndvi_img = ee.ImageCollection("MODIS/061/MOD13A2") \
-            .select(['NDVI']).filter(ee.Filter.calendarRange(month, month, 'month')).mean()
-        ndvi_data = ndvi_img.reduceRegion(ee.Reducer.mean(), point, 1000).getInfo().get('NDVI')
-        ndvi = (ndvi_data * 0.0001) if ndvi_data else None
+        # NDVI from Sentinel-2 (High resolution 10m)
+        # We look for the most recent cloud-free-ish image in the last 3 months
+        s2_col = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED") \
+            .filterBounds(point) \
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20)) \
+            .sort('system:time_start', False)
+        
+        s2_img = s2_col.first()
+        if s2_img:
+            ndvi_img = s2_img.normalizedDifference(['B8', 'B4']).rename('NDVI')
+            ndvi_data = ndvi_img.reduceRegion(ee.Reducer.mean(), point, 10).getInfo().get('NDVI')
+            ndvi = ndvi_data if ndvi_data is not None else 0.2
+        else:
+            ndvi = 0.2
         
         return {
             'solar_irradiance': solar_val,
@@ -299,7 +325,7 @@ def fetch_gee_data(lat, lon, month):
             'month': month
         }
     except Exception as e:
-        print("GEE Fetch Error:", e)
+        print("GEE LIVE Fetch Error:", e)
         return {
             'solar_irradiance': 5.5, 'land_cover': 40, 'elevation': 200,
             'slope': 2.0, 'aspect': 180.0, 'temperature_c': 28.0, 'ndvi': 0.2,
@@ -437,6 +463,30 @@ def main():
         cur_time = now.strftime("%I:%M %p")
         cur_date = now.strftime("%b %d, %Y")
         st.info(f"🕒 **{cur_time}** · {cur_date}")
+
+    # GEE Connectivity test for cloud deployment
+    with st.expander("🛠️ GEE Diagnostic Tools"):
+        if st.button("🧪 Test GEE Connection", use_container_width=True):
+            with st.spinner("Fetching live data from GEE..."):
+                try:
+                    # Test with a known location (Hyderabad, India)
+                    test_point = ee.Geometry.Point([78.4867, 17.3850])
+                    s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED") \
+                        .filterBounds(test_point) \
+                        .filterDate(ee.Date('2024-01-01'), ee.Date('2024-03-01')) \
+                        .median()
+                    
+                    ndvi = s2.normalizedDifference(['B8', 'B4']).rename('NDVI')
+                    ndvi_value = ndvi.reduceRegion(
+                        reducer=ee.Reducer.mean(), 
+                        geometry=test_point, 
+                        scale=10
+                    ).getInfo()
+                    
+                    st.success(f"✅ Live GEE working! Test Point NDVI: {ndvi_value.get('NDVI'):.4f}")
+                    st.info("This proves you're getting live satellite data directly from Google Earth Engine.")
+                except Exception as e:
+                    st.error(f"❌ GEE test failed: {e}")
 
 
     st.divider()

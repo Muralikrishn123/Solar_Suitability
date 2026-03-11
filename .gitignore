@@ -1,3 +1,8 @@
+# Data Files
+*.xlsx
+*.csv
+# *.pkl  # Keep if needed for app, but usually ignore large ones
+
 # Environments
 venv/
 env/
