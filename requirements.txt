@@ -8,6 +8,3 @@ joblib>=1.2.0
 plotly>=5.14.0
 scikit-learn==1.5.2
 lightgbm==4.6.0
-geemap
-geopandas
-openpyxl
